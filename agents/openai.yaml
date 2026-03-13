@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Discuss"
+  short_description: "Threaded cross-agent discussion"
+  default_prompt: "Discuss a task with another agent using distilled context, selected assets, and resumable thread state."
