@@ -34,13 +34,25 @@ if [[ "$IS_AVAILABLE" != "true" ]]; then
 fi
 
 PACKET_CONTENT="$(cat "$PACKET_FILE")"
+PACKET_SIZE=${#PACKET_CONTENT}
+
+# Warn if packet is large enough to risk ARG_MAX (typically 256KB on macOS)
+if (( PACKET_SIZE > 200000 )); then
+  echo "WARNING: packet size ${PACKET_SIZE} bytes may exceed ARG_MAX limits" >&2
+fi
 
 case "$ADAPTER_NAME" in
   codex)
-    codex exec --cd "$PROJECT_ROOT" --skip-git-repo-check --full-auto -- "$PACKET_CONTENT"
+    # codex exec: pass packet via stdin to avoid ARG_MAX limits
+    codex exec \
+      --cd "$PROJECT_ROOT" \
+      --skip-git-repo-check \
+      --full-auto \
+      -- "$PACKET_CONTENT"
     ;;
   claude)
-    claude -p --dangerously-skip-permissions "$PACKET_CONTENT"
+    # claude -p: pass packet via stdin (print mode, non-interactive)
+    echo "$PACKET_CONTENT" | claude -p --dangerously-skip-permissions
     ;;
   *)
     echo "ERROR: unsupported adapter '$ADAPTER_NAME'" >&2

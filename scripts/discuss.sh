@@ -88,6 +88,8 @@ emit("PREV_DIRECTION", data.get("current_direction", ""))
 emit("PREV_CONSTRAINTS", data.get("constraints", ""))
 emit("PREV_ASK", data.get("next_action", ""))
 emit("PREV_SYNTHESIS", data.get("last_remote_takeaways", ""))
+emit("PREV_OPEN_QUESTIONS", data.get("open_questions", []))
+emit("PREV_LAST_ADAPTER", data.get("last_adapter", ""))
 emit("PREV_ASSETS", data.get("selected_assets", []))
 PYEOF
   )"
@@ -104,6 +106,9 @@ write_request_json() {
   ROUND="$ROUND" \
   REQUEST_FILE="$REQUEST_FILE" \
   ASSET_LIST_FILE="$ASSET_LIST_FILE" \
+  PRIOR_SYNTHESIS="${PRIOR_SYNTHESIS:-}" \
+  PRIOR_OPEN_QUESTIONS="${PRIOR_OPEN_QUESTIONS:-}" \
+  PRIOR_NEXT_STEP="${PRIOR_NEXT_STEP:-}" \
   python3 - <<'PYEOF'
 import json
 import os
@@ -113,6 +118,9 @@ assets = []
 asset_list_file = os.environ["ASSET_LIST_FILE"]
 if Path(asset_list_file).exists():
     assets = [line.strip() for line in Path(asset_list_file).read_text().splitlines() if line.strip()]
+
+open_q_raw = os.environ.get("PRIOR_OPEN_QUESTIONS", "")
+open_questions = [q.strip() for q in open_q_raw.splitlines() if q.strip()] if open_q_raw else []
 
 data = {
     "thread_id": os.environ["THREAD_ID"],
@@ -124,6 +132,9 @@ data = {
     "ask": os.environ["ASK"],
     "selected_assets": assets,
     "latest_local_changes": os.environ["LOCAL_CHANGES"],
+    "prior_synthesis": os.environ.get("PRIOR_SYNTHESIS", ""),
+    "prior_open_questions": open_questions,
+    "prior_next_step": os.environ.get("PRIOR_NEXT_STEP", ""),
 }
 
 Path(os.environ["REQUEST_FILE"]).write_text(json.dumps(data, indent=2) + "\n")
@@ -162,6 +173,33 @@ for asset in data.get("selected_assets", []):
 
 selected_assets = "\n\n".join(asset_sections) if asset_sections else "(no assets selected)"
 
+# Build prior round context section (only for round 2+)
+prior_section = ""
+prior_syn = data.get("prior_synthesis", "")
+prior_oq = data.get("prior_open_questions", [])
+prior_ns = data.get("prior_next_step", "")
+
+if prior_syn or prior_oq or prior_ns:
+    parts = ["## Prior round context", ""]
+    rnd = data.get("round", 1)
+    if prior_syn:
+        parts.append(f"### Synthesis from round {rnd - 1}")
+        parts.append("")
+        parts.append(prior_syn)
+        parts.append("")
+    if prior_oq:
+        parts.append("### Open questions from last round")
+        parts.append("")
+        for q in prior_oq:
+            parts.append(f"- {q}")
+        parts.append("")
+    if prior_ns:
+        parts.append("### Last recommended next step")
+        parts.append("")
+        parts.append(prior_ns)
+        parts.append("")
+    prior_section = "\n".join(parts)
+
 packet = f"""# Agent Discuss Packet
 
 ## What this is
@@ -184,7 +222,7 @@ You are the other agent in a focused working discussion. This is not a review ve
 
 {data['constraints'] or '(not provided)'}
 
-## Latest local changes
+{prior_section}## Latest local changes
 
 ```text
 {data['latest_local_changes'] or '(no local changes summary)'}
@@ -334,6 +372,13 @@ if not result["pushback"]:
     result["pushback"] = ["The remote reply did not include explicit pushback. Re-check the current direction for weak assumptions."]
     result["_validation_warnings"].append("Reply did not include explicit pushback; inserted fallback pushback.")
 
+# Pushback quality check: require >= 2 items, each >= 20 chars
+real_pushback = [p for p in result["pushback"] if len(p) >= 20]
+if len(real_pushback) < 2:
+    result["_validation_warnings"].append(
+        f"pushback_quality: insufficient ({len(real_pushback)} substantive items, need >= 2)"
+    )
+
 if not result["one_paragraph_synthesis"]:
     result["one_paragraph_synthesis"] = "The remote reply was normalized, but no synthesis paragraph was provided."
     result["_validation_warnings"].append("Reply did not include a synthesis paragraph; inserted fallback synthesis.")
@@ -345,6 +390,16 @@ if not (result["agreement"] or result["risks"] or result["better_options"]):
     result["_validation_warnings"].append(
         "Reply has no substantive agreement, risks, or better_options content."
     )
+
+# Quality gate: pass / warn / fail
+if confidence == "failed":
+    quality_gate = "fail"
+elif confidence == "degraded" or len(real_pushback) < 2 or len(result["one_paragraph_synthesis"]) < 50:
+    quality_gate = "warn"
+else:
+    quality_gate = "pass"
+
+result["_quality_gate"] = quality_gate
 
 Path(os.environ["REPLY_JSON_FILE"]).write_text(json.dumps(result, indent=2) + "\n")
 PYEOF
@@ -372,6 +427,7 @@ content = "\n".join([
     "## Normalization",
     "",
     f"- confidence: {data.get('_normalized_confidence', 'unknown')}",
+    f"- quality_gate: {data.get('_quality_gate', 'unknown')}",
     *([f"- warning: {item}" for item in data.get("_validation_warnings", [])] or ["- warning: (none)"]),
     "",
     section("Agreement", data["agreement"]),
@@ -399,6 +455,8 @@ write_state() {
   STATE_FILE="$STATE_FILE" \
   REL_PACKET_FILE="$REL_THREAD_DIR/packet.md" \
   REL_REPLY_JSON_FILE="$REL_THREAD_DIR/reply.json" \
+  INITIATOR="${INITIATOR:-}" \
+  CURRENT_ADAPTER="${CURRENT_ADAPTER:-}" \
   python3 - <<'PYEOF'
 import json
 import os
@@ -420,6 +478,8 @@ state = {
     "last_remote_takeaways": reply["one_paragraph_synthesis"],
     "open_questions": reply["questions_back"],
     "next_action": reply["recommended_next_step"],
+    "initiator": os.environ.get("INITIATOR", ""),
+    "last_adapter": os.environ.get("CURRENT_ADAPTER", ""),
     "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "latest_packet": os.environ["REL_PACKET_FILE"],
     "latest_reply": os.environ["REL_REPLY_JSON_FILE"],
@@ -432,6 +492,7 @@ PYEOF
 render_brief() {
   STATE_FILE="$STATE_FILE" \
   BRIEF_FILE="$BRIEF_FILE" \
+  REPLY_JSON_FILE="$REPLY_JSON_FILE" \
   python3 - <<'PYEOF'
 import json
 import os
@@ -440,6 +501,21 @@ from pathlib import Path
 state = json.loads(Path(os.environ["STATE_FILE"]).read_text())
 questions = "\n".join(f"- {item}" for item in state.get("open_questions", [])) or "- (none)"
 assets = "\n".join(f"- {item}" for item in state.get("selected_assets", [])) or "- (none)"
+
+# Read quality gate from reply.json if available
+quality_section = ""
+reply_path = Path(os.environ.get("REPLY_JSON_FILE", ""))
+if reply_path.exists():
+    reply = json.loads(reply_path.read_text())
+    qg = reply.get("_quality_gate", "")
+    if qg in ("warn", "fail"):
+        warnings = reply.get("_validation_warnings", [])
+        warn_lines = "\n".join(f"- {w}" for w in warnings) if warnings else "- (none)"
+        quality_section = f"""
+## Quality Gate: {qg.upper()}
+
+{warn_lines}
+"""
 
 content = f"""# Thread Brief
 
@@ -466,7 +542,7 @@ content = f"""# Thread Brief
 ## Next Action
 
 {state.get('next_action', '')}
-"""
+{quality_section}"""
 
 Path(os.environ["BRIEF_FILE"]).write_text(content)
 PYEOF
@@ -498,16 +574,33 @@ PYEOF
 }
 
 select_adapter() {
-  python3 - "$ADAPTERS_CACHE" "$ADAPTER" <<'PYEOF'
+  python3 - "$ADAPTERS_CACHE" "$ADAPTER" "${PREV_LAST_ADAPTER:-}" "${IS_CONTINUE:-false}" <<'PYEOF'
 import json
 import pathlib
 import sys
 
 data = json.loads(pathlib.Path(sys.argv[1]).read_text())
 requested = sys.argv[2]
+prev_adapter = sys.argv[3]
+is_continue = sys.argv[4] == "true"
+
+# Level 1: explicit --adapter flag
 if requested:
     print(requested)
     raise SystemExit(0)
+
+# Level 2: continue + cross_model available → opposite adapter
+if is_continue and prev_adapter:
+    cross_model = data.get("cross_model", False)
+    if cross_model:
+        opposite = {"codex": "claude", "claude": "codex"}.get(prev_adapter, "")
+        if opposite:
+            adapter_info = data.get("adapters", {}).get(opposite, {})
+            if adapter_info.get("available"):
+                print(opposite)
+                raise SystemExit(0)
+
+# Level 3: fallback to recommended_reviewer
 print(data.get("recommended_reviewer", "none"))
 PYEOF
 }
@@ -576,6 +669,11 @@ case "$SUBCOMMAND" in
     [[ -z "$DIRECTION" ]] && DIRECTION="${PREV_DIRECTION}"
     [[ -z "$CONSTRAINTS" ]] && CONSTRAINTS="${PREV_CONSTRAINTS}"
     [[ -z "$ASK" ]] && ASK="Continue the discussion from the prior synthesis and pressure-test the updated direction."
+    PRIOR_SYNTHESIS="${PREV_SYNTHESIS:-}"
+    PRIOR_OPEN_QUESTIONS="${PREV_OPEN_QUESTIONS:-}"
+    PRIOR_NEXT_STEP="${PREV_ASK:-}"
+    PREV_LAST_ADAPTER="${PREV_LAST_ADAPTER:-}"
+    IS_CONTINUE="true"
     if (( ${#ASSET_LIST[@]} == 0 )) && [[ -n "${PREV_ASSETS:-}" ]]; then
       while IFS= read -r item; do
         [[ -n "$item" ]] && ASSET_LIST+=("$item")
@@ -641,11 +739,17 @@ if [[ "$VALIDATE_ONLY" == "true" ]]; then
   [[ -n "$REPLY_FILE" ]] || { echo "ERROR: --validate-only requires --reply-file or validate <raw-reply-file>" >&2; exit 1; }
   : > "$DEBUG_LOG_FILE"
   cp "$REPLY_FILE" "$RAW_REPLY_FILE"
+  CURRENT_ADAPTER="${CURRENT_ADAPTER:-validate}"
+  INITIATOR="${INITIATOR:-user}"
 elif [[ -n "$REPLY_FILE" ]]; then
   : > "$DEBUG_LOG_FILE"
   cp "$REPLY_FILE" "$RAW_REPLY_FILE"
+  CURRENT_ADAPTER="${CURRENT_ADAPTER:-manual}"
+  INITIATOR="${INITIATOR:-user}"
 elif [[ "$DRY_RUN" == "true" ]]; then
   : > "$DEBUG_LOG_FILE"
+  CURRENT_ADAPTER="${CURRENT_ADAPTER:-dry-run}"
+  INITIATOR="${INITIATOR:-dry-run}"
   cat > "$RAW_REPLY_FILE" <<'EOF'
 {
   "agreement": ["The direction is coherent enough for a first pass."],
@@ -664,6 +768,8 @@ else
   ADAPTERS_CACHE="$PROJECT_ROOT/.ai/cache/preflight/adapters.json"
   SELECTED_ADAPTER="$(select_adapter)"
   [[ "$SELECTED_ADAPTER" != "none" ]] || { echo "ERROR: no available adapter" >&2; exit 1; }
+  CURRENT_ADAPTER="$SELECTED_ADAPTER"
+  [[ -n "${INITIATOR:-}" ]] || INITIATOR="$SELECTED_ADAPTER"
   "$SCRIPT_DIR/invoke_adapter.sh" "$SELECTED_ADAPTER" "$PACKET_FILE" "$PROJECT_ROOT" > "$RAW_REPLY_FILE" 2> "$DEBUG_LOG_FILE"
 fi
 
